@@ -147,17 +147,49 @@ public sealed class CollectorService(
     {
         await ValidatePublicUrl(homepage, ct);
         var http = clients.CreateClient("feeds");
-        using var response = await http.GetAsync(homepage, HttpCompletionOption.ResponseHeadersRead, ct);
-        response.EnsureSuccessStatusCode();
-        var html = await response.Content.ReadAsStringAsync(ct);
-        if (html.Length > 1_000_000) html = html[..1_000_000];
-        var match = Regex.Match(html,
-            """<link\\b(?=[^>]*rel=["']alternate["'])(?=[^>]*type=["']application/(?:rss|atom)\\+xml["'])[^>]*href=["']([^"']+)["']""",
-            RegexOptions.IgnoreCase);
-        if (!match.Success) throw new InvalidDataException("No RSS/Atom link found on homepage");
-        var resolved = new Uri(new Uri(homepage), WebUtility.HtmlDecode(match.Groups[1].Value)).AbsoluteUri;
-        await ValidatePublicUrl(resolved, ct);
-        return resolved;
+        var candidates = new List<string>();
+        try
+        {
+            using var response = await http.GetAsync(homepage, HttpCompletionOption.ResponseHeadersRead, ct);
+            response.EnsureSuccessStatusCode();
+            var html = await response.Content.ReadAsStringAsync(ct);
+            if (html.Length > 1_000_000) html = html[..1_000_000];
+            var matches = Regex.Matches(html,
+                """<link\\b(?=[^>]*rel=["']alternate["'])(?=[^>]*type=["']application/(?:rss|atom)\\+xml["'])[^>]*href=["']([^"']+)["']""",
+                RegexOptions.IgnoreCase);
+            foreach (Match match in matches)
+            {
+                if (Uri.TryCreate(new Uri(homepage), WebUtility.HtmlDecode(match.Groups[1].Value), out var resolved))
+                    candidates.Add(resolved.AbsoluteUri);
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "Homepage discovery failed for {Homepage}; trying conventional RSS paths", homepage);
+        }
+
+        var root = new Uri(new Uri(homepage).GetLeftPart(UriPartial.Authority));
+        foreach (var path in new[] { "/rss/", "/rss", "/feed/", "/rss.xml", "/atom.xml" })
+            candidates.Add(new Uri(root, path).AbsoluteUri);
+
+        foreach (var candidate in candidates.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            try
+            {
+                // DownloadFeed checks HTTPS/public DNS, parses RSS/Atom and limits response size.
+                // Require an actual entry, rather than accepting an HTML page with HTTP 200.
+                if ((await DownloadFeed(candidate, ct)).Count > 0)
+                    return candidate;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            {
+                logger.LogDebug(ex, "RSS candidate rejected: {Candidate}", candidate);
+            }
+        }
+
+        throw new InvalidDataException("No valid RSS/Atom feed found on homepage or conventional paths");
     }
 
     private async Task<List<(string Url, string Title, DateTime? PublishedAt)>> DownloadFeed(string feed, CancellationToken ct)
