@@ -131,13 +131,24 @@ public sealed class CollectorService(
                 UPDATE news_collection_jobs SET
                   consecutive_failures=consecutive_failures+1,
                   last_error=@error, last_duration_ms=@duration,
-                  next_attempt_at=now()+interval '15 minutes',
+                  next_attempt_at=now() + (
+                    CASE
+                      WHEN @missingFeed THEN
+                        CASE WHEN consecutive_failures + 1 >= 3 THEN 1440 ELSE 60 END
+                      ELSE
+                        CASE
+                          WHEN consecutive_failures + 1 >= 6 THEN 360
+                          WHEN consecutive_failures + 1 >= 3 THEN 60
+                          ELSE 15
+                        END
+                    END * interval '1 minute'),
                   lease_until=NULL, lease_owner=NULL
                 WHERE source_id=@id AND lease_owner=@owner;
                 """, db);
             cmd.Parameters.AddWithValue("id", job.Id);
             cmd.Parameters.AddWithValue("owner", owner);
             cmd.Parameters.AddWithValue("error", ex.Message[..Math.Min(ex.Message.Length, 500)]);
+            cmd.Parameters.AddWithValue("missingFeed", ex is InvalidDataException && ex.Message.StartsWith("No valid RSS/Atom feed", StringComparison.Ordinal));
             cmd.Parameters.AddWithValue("duration", (int)watch.ElapsedMilliseconds);
             await cmd.ExecuteNonQueryAsync(ct);
         }
