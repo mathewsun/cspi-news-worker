@@ -148,45 +148,65 @@ public sealed class CollectorService(
         await ValidatePublicUrl(homepage, ct);
         var http = clients.CreateClient("feeds");
         var candidates = new List<string>();
-        try
+        var root = new Uri(new Uri(homepage).GetLeftPart(UriPartial.Authority));
+
+        // HTML attribute order is not significant. Inspect each link element
+        // independently rather than assuming rel/type precede href.
+        async Task InspectPage(string page)
         {
-            using var response = await http.GetAsync(homepage, HttpCompletionOption.ResponseHeadersRead, ct);
+            await ValidatePublicUrl(page, ct);
+            using var response = await http.GetAsync(page, HttpCompletionOption.ResponseHeadersRead, ct);
             response.EnsureSuccessStatusCode();
-            var html = await response.Content.ReadAsStringAsync(ct);
-            if (html.Length > 1_000_000) html = html[..1_000_000];
-            var matches = Regex.Matches(html,
-                """<link\\b(?=[^>]*rel=["']alternate["'])(?=[^>]*type=["']application/(?:rss|atom)\\+xml["'])[^>]*href=["']([^"']+)["']""",
-                RegexOptions.IgnoreCase);
-            foreach (Match match in matches)
+            await using var stream = await response.Content.ReadAsStreamAsync(ct);
+            using var limited = new LimitedStream(stream, 1_000_000);
+            using var reader = new StreamReader(limited);
+            var html = await reader.ReadToEndAsync(ct);
+            foreach (Match tag in Regex.Matches(html, @"<link\b[^>]*>", RegexOptions.IgnoreCase))
             {
-                if (Uri.TryCreate(new Uri(homepage), WebUtility.HtmlDecode(match.Groups[1].Value), out var resolved))
+                var attrs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                foreach (Match attr in Regex.Matches(tag.Value,
+                    """([a-zA-Z][\w:-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')"""))
+                    attrs[attr.Groups[1].Value] = WebUtility.HtmlDecode(
+                        attr.Groups[2].Success ? attr.Groups[2].Value : attr.Groups[3].Value);
+
+                if (!attrs.TryGetValue("href", out var href) ||
+                    !attrs.TryGetValue("rel", out var rel) ||
+                    !rel.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+                        .Contains("alternate", StringComparer.OrdinalIgnoreCase) ||
+                    !attrs.TryGetValue("type", out var type) ||
+                    !(type.Contains("rss+xml", StringComparison.OrdinalIgnoreCase) ||
+                      type.Contains("atom+xml", StringComparison.OrdinalIgnoreCase)))
+                    continue;
+
+                if (Uri.TryCreate(new Uri(page), href, out var resolved))
                     candidates.Add(resolved.AbsoluteUri);
             }
         }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
-        catch (Exception ex)
+
+        foreach (var page in new[] { homepage, new Uri(root, "/news").AbsoluteUri,
+                                      new Uri(root, "/feeds").AbsoluteUri })
         {
-            logger.LogDebug(ex, "Homepage discovery failed for {Homepage}; trying conventional RSS paths", homepage);
+            try { await InspectPage(page); }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception ex) { logger.LogDebug(ex, "RSS discovery page failed: {Page}", page); }
         }
 
-        var root = new Uri(new Uri(homepage).GetLeftPart(UriPartial.Authority));
-        foreach (var path in new[] { "/rss/", "/rss", "/feed/", "/rss.xml", "/atom.xml" })
+        foreach (var path in new[] {
+            "/rss/", "/rss", "/feed/", "/feeds/", "/rss.xml", "/feed.xml",
+            "/atom.xml", "/index.xml", "/rss.php", "/feeds/posts/default",
+            "/news/rss.xml", "/news/rss", "/world/rss"
+        })
             candidates.Add(new Uri(root, path).AbsoluteUri);
 
         foreach (var candidate in candidates.Distinct(StringComparer.OrdinalIgnoreCase))
         {
             try
             {
-                // DownloadFeed checks HTTPS/public DNS, parses RSS/Atom and limits response size.
-                // Require an actual entry, rather than accepting an HTML page with HTTP 200.
                 if ((await DownloadFeed(candidate, ct)).Count > 0)
                     return candidate;
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
-            catch (Exception ex)
-            {
-                logger.LogDebug(ex, "RSS candidate rejected: {Candidate}", candidate);
-            }
+            catch (Exception ex) { logger.LogDebug(ex, "RSS candidate rejected: {Candidate}", candidate); }
         }
 
         throw new InvalidDataException("No valid RSS/Atom feed found on homepage or conventional paths");
