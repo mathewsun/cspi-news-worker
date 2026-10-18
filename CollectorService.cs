@@ -19,31 +19,33 @@ public sealed class CollectorService(
         ?? throw new InvalidOperationException("ConnectionStrings:DefaultConnection is required");
     private readonly int concurrency = Math.Clamp(config.GetValue("Collector:Concurrency", 16), 1, 64);
     private readonly int intervalMinutes = Math.Clamp(config.GetValue("Collector:IntervalMinutes", 10), 5, 60);
-    private const string ClaimSql = """
+    private readonly int jobSeconds=Math.Clamp(config.GetValue("Collector:JobTimeoutSeconds",60),1,60);
+    private readonly TimeSpan requestTimeout=TimeSpan.FromSeconds(Math.Clamp(config.GetValue("Collector:RequestTimeoutSeconds",12),1,12));
+    public const string Eligibility = """
+        EXISTS (SELECT 1 FROM "Sources" s WHERE s."Id"=j.source_id AND s."Status" NOT IN (4,5)
+            AND ((s."CollectionEnabled" IS TRUE AND s."VerificationState"='Verified'
+                    AND NOT EXISTS (SELECT 1 FROM "NewsSourceCoverages" c WHERE c."SourceId"=s."Id"
+                        AND c."VerificationState" IN ('VerificationFailed','Unavailable','Suspended')))
+                OR (s."CollectionEnabled" IS NULL AND EXISTS (SELECT 1 FROM "NewsSourceCoverages" c
+                    WHERE c."SourceId"=s."Id" AND c."CollectionEnabled" AND c."VerificationState"='Verified'))))
+        """;
+    private static readonly string ClaimSql = $$"""
         WITH due AS (
           SELECT j.source_id FROM news_collection_jobs j
-          WHERE j.next_attempt_at <= now()
-            AND (j.lease_until IS NULL OR j.lease_until < now())
-            AND EXISTS (
-              SELECT 1 FROM "NewsSourceCoverages" c
-              WHERE c."SourceId"=j.source_id AND c."CollectionEnabled"
-                AND c."VerificationState"='Verified'
-            )
-          ORDER BY j.next_attempt_at, j.source_id
-          FOR UPDATE SKIP LOCKED LIMIT 1
+          WHERE j.next_attempt_at <= now() AND (j.lease_until IS NULL OR j.lease_until < now())
+            AND {{Eligibility}}
+          ORDER BY j.next_attempt_at,j.source_id FOR UPDATE SKIP LOCKED LIMIT 1
         )
-        UPDATE news_collection_jobs j
-        SET lease_until=now()+interval '90 seconds', lease_owner=@owner
+        UPDATE news_collection_jobs j SET lease_until=now()+interval '90 seconds',lease_owner=@owner
         FROM due WHERE j.source_id=due.source_id
-        RETURNING j.source_id, j.feed_url,
-          (SELECT s."Url" FROM "Sources" s WHERE s."Id"=j.source_id);
+        RETURNING j.source_id,j.feed_url,(SELECT s."Url" FROM "Sources" s WHERE s."Id"=j.source_id)
         """;
-
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         logger.LogInformation("Collector starting owner={Owner} concurrency={Concurrency} interval={Interval}m",
             owner, concurrency, intervalMinutes);
-        var workers = Enumerable.Range(0, concurrency).Select(_ => Loop(stoppingToken));
+        await SynchronizeAsync(stoppingToken);
+        var workers = Enumerable.Range(0, concurrency).Select(_ => Loop(stoppingToken)).Append(SyncLoop(stoppingToken));
         await Task.WhenAll(workers);
     }
 
@@ -53,9 +55,7 @@ public sealed class CollectorService(
         {
             try
             {
-                var job = await Claim(ct);
-                if (job is null) { await Task.Delay(TimeSpan.FromSeconds(3), ct); continue; }
-                await Process(job.Value, ct);
+                if(!await RunOnceAsync(ct)) await Task.Delay(TimeSpan.FromSeconds(3),ct);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
             catch (Exception ex)
@@ -66,6 +66,33 @@ public sealed class CollectorService(
         }
     }
 
+    public async Task<bool> RunOnceAsync(CancellationToken ct=default)
+    {
+        var job=await Claim(ct);if(job==null)return false;
+        await Process(job.Value,ct);return true;
+    }
+    public async Task SynchronizeAsync(CancellationToken ct=default)
+    {
+        await using var db=new NpgsqlConnection(connection);await db.OpenAsync(ct);
+        await using var cmd=new NpgsqlCommand("""
+            INSERT INTO news_collection_jobs (source_id)
+            SELECT s."Id" FROM "Sources" s
+            WHERE s."CollectionEnabled" IS TRUE AND s."VerificationState"='Verified' AND s."Status" NOT IN (4,5)
+              AND NOT EXISTS (SELECT 1 FROM "NewsSourceCoverages" c WHERE c."SourceId"=s."Id"
+                AND c."VerificationState" IN ('VerificationFailed','Unavailable','Suspended'))
+            ON CONFLICT (source_id) DO NOTHING
+            """,db);
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+    private async Task SyncLoop(CancellationToken ct)
+    {
+        while(!ct.IsCancellationRequested)
+        {
+            try {await Task.Delay(TimeSpan.FromMinutes(1),ct);await SynchronizeAsync(ct);}
+            catch(OperationCanceledException) when(ct.IsCancellationRequested){break;}
+            catch(Exception ex){logger.LogError(ex,"Automatic source queue synchronization failed");}
+        }
+    }
     private async Task<(int Id, string? Feed, string? Homepage)?> Claim(CancellationToken ct)
     {
         await using var db = new NpgsqlConnection(connection);
@@ -81,14 +108,22 @@ public sealed class CollectorService(
     private async Task Process((int Id, string? Feed, string? Homepage) job, CancellationToken ct)
     {
         var watch = Stopwatch.StartNew();
+        using var budget=CancellationTokenSource.CreateLinkedTokenSource(ct);budget.CancelAfter(TimeSpan.FromSeconds(jobSeconds));
+        var token=budget.Token;
         try
         {
             var homepage = job.Homepage ?? throw new InvalidDataException("Source URL missing");
-            var feed = job.Feed ?? await Discover(homepage, ct);
-            var items = await DownloadFeed(feed, ct);
+            var feed = job.Feed ?? await Discover(homepage, token);
+            var items = await DownloadFeed(feed, token);
             await using var db = new NpgsqlConnection(connection);
-            await db.OpenAsync(ct);
-            await using var tx = await db.BeginTransactionAsync(ct);
+            await db.OpenAsync(token);
+            await using var tx = await db.BeginTransactionAsync(token);
+            // Fence before storing items: disabling or expiry cannot commit stale results.
+            await using(var fence=new NpgsqlCommand($"SELECT 1 FROM news_collection_jobs j WHERE source_id=@id AND lease_owner=@owner AND lease_until>now() AND ({Eligibility}) FOR UPDATE OF j",db,tx))
+            {
+                fence.Parameters.AddWithValue("id",job.Id);fence.Parameters.AddWithValue("owner",owner);
+                if(await fence.ExecuteScalarAsync(token)==null)return;
+            }
             var added = 0;
             foreach (var item in items.Take(100))
             {
@@ -101,7 +136,7 @@ public sealed class CollectorService(
                 cmd.Parameters.AddWithValue("url", item.Url);
                 cmd.Parameters.AddWithValue("title", item.Title);
                 cmd.Parameters.AddWithValue("date", (object?)item.PublishedAt ?? DBNull.Value);
-                added += await cmd.ExecuteNonQueryAsync(ct);
+                added += await cmd.ExecuteNonQueryAsync(token);
             }
             await using (var cmd = new NpgsqlCommand("""
                 UPDATE news_collection_jobs SET feed_url=@feed,
@@ -116,15 +151,17 @@ public sealed class CollectorService(
                 cmd.Parameters.AddWithValue("minutes", intervalMinutes);
                 cmd.Parameters.AddWithValue("id", job.Id);
                 cmd.Parameters.AddWithValue("owner", owner);
-                await cmd.ExecuteNonQueryAsync(ct);
+                await cmd.ExecuteNonQueryAsync(token);
             }
-            await tx.CommitAsync(ct);
+            await tx.CommitAsync(token);
             logger.LogInformation("Source={Source} newItems={Count} durationMs={Duration}",
                 job.Id, added, watch.ElapsedMilliseconds);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (!ct.IsCancellationRequested)
         {
             logger.LogWarning(ex, "Source={Source} failed", job.Id);
+            using var failureBudget=new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            ct=failureBudget.Token;
             await using var db = new NpgsqlConnection(connection);
             await db.OpenAsync(ct);
             await using var cmd = new NpgsqlCommand("""
@@ -152,12 +189,25 @@ public sealed class CollectorService(
             cmd.Parameters.AddWithValue("duration", (int)watch.ElapsedMilliseconds);
             await cmd.ExecuteNonQueryAsync(ct);
         }
+        finally
+        {
+            using var cleanup=new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            await using var db=new NpgsqlConnection(connection);await db.OpenAsync(cleanup.Token);
+            await using var release=new NpgsqlCommand("UPDATE news_collection_jobs SET lease_until=NULL,lease_owner=NULL WHERE source_id=@id AND lease_owner=@owner",db);
+            release.Parameters.AddWithValue("id",job.Id);release.Parameters.AddWithValue("owner",owner);
+            await release.ExecuteNonQueryAsync(cleanup.Token);
+        }
     }
 
     private async Task<string> Discover(string homepage, CancellationToken ct)
     {
-        await ValidatePublicUrl(homepage, ct);
-        var http = clients.CreateClient("feeds");
+        PublicFeedNetwork.ValidateUri(new Uri(homepage));
+        using var http = new PublicFeedHttp(clients.CreateClient("feeds"),requestTimeout);
+        try {await DownloadFeed(homepage,ct);return homepage;}
+        catch(OperationCanceledException) when(ct.IsCancellationRequested){throw;}
+        catch(System.Security.SecurityException){throw;}
+        catch(InvalidDataException ex) when(ex.Message=="Source DNS resolution failed"){throw;}
+        catch(Exception ex){logger.LogDebug(ex,"Source URL is not a feed");}
         var candidates = new List<string>();
         var root = new Uri(new Uri(homepage).GetLeftPart(UriPartial.Authority));
 
@@ -165,18 +215,15 @@ public sealed class CollectorService(
         // independently rather than assuming rel/type precede href.
         async Task InspectPage(string page)
         {
-            await ValidatePublicUrl(page, ct);
-            using var response = await http.GetAsync(page, HttpCompletionOption.ResponseHeadersRead, ct);
-            response.EnsureSuccessStatusCode();
-            await using var stream = await response.Content.ReadAsStreamAsync(ct);
-            using var limited = new LimitedStream(stream, 1_000_000);
-            using var reader = new StreamReader(limited);
-            var html = await reader.ReadToEndAsync(ct);
-            foreach (Match tag in Regex.Matches(html, @"<link\b[^>]*>", RegexOptions.IgnoreCase))
+            var response=await http.ReadAsync(page,1_000_000,ct);
+            page=response.Url.AbsoluteUri;
+            var html=System.Text.Encoding.UTF8.GetString(response.Body);
+            foreach (Match tag in Regex.Matches(html, @"<link\b[^>]*>", RegexOptions.IgnoreCase,TimeSpan.FromSeconds(1)))
             {
+                ct.ThrowIfCancellationRequested();
                 var attrs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                 foreach (Match attr in Regex.Matches(tag.Value,
-                    """([a-zA-Z][\w:-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')"""))
+                    """([a-zA-Z][\w:-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')""",RegexOptions.None,TimeSpan.FromSeconds(1)))
                     attrs[attr.Groups[1].Value] = WebUtility.HtmlDecode(
                         attr.Groups[2].Success ? attr.Groups[2].Value : attr.Groups[3].Value);
 
@@ -199,6 +246,7 @@ public sealed class CollectorService(
         {
             try { await InspectPage(page); }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch(System.Security.SecurityException){throw;}
             catch (Exception ex) { logger.LogDebug(ex, "RSS discovery page failed: {Page}", page); }
         }
 
@@ -213,10 +261,10 @@ public sealed class CollectorService(
         {
             try
             {
-                if ((await DownloadFeed(candidate, ct)).Count > 0)
-                    return candidate;
+                await DownloadFeed(candidate,ct);return candidate;
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch(System.Security.SecurityException){throw;}
             catch (Exception ex) { logger.LogDebug(ex, "RSS candidate rejected: {Candidate}", candidate); }
         }
 
@@ -225,13 +273,13 @@ public sealed class CollectorService(
 
     private async Task<List<(string Url, string Title, DateTime? PublishedAt)>> DownloadFeed(string feed, CancellationToken ct)
     {
-        await ValidatePublicUrl(feed, ct);
-        var http = clients.CreateClient("feeds");
-        using var response = await http.GetAsync(feed, HttpCompletionOption.ResponseHeadersRead, ct);
-        response.EnsureSuccessStatusCode();
-        await using var stream = await response.Content.ReadAsStreamAsync(ct);
-        using var limited = new LimitedStream(stream, 2_000_000);
-        var xml = await XDocument.LoadAsync(limited, LoadOptions.None, ct);
+        using var http=new PublicFeedHttp(clients.CreateClient("feeds"),requestTimeout);
+        var response=await http.ReadAsync(feed,2_000_000,ct);
+        using var stream=new MemoryStream(response.Body);
+        using var reader=System.Xml.XmlReader.Create(stream,new System.Xml.XmlReaderSettings
+            {Async=true,DtdProcessing=System.Xml.DtdProcessing.Prohibit,XmlResolver=null,MaxCharactersInDocument=2_000_000});
+        var xml=await XDocument.LoadAsync(reader,LoadOptions.None,ct);
+        if(xml.Root?.Name.LocalName is not ("rss" or "feed" or "RDF"))throw new InvalidDataException("Not an RSS/Atom document");
         var result = new List<(string, string, DateTime?)>();
         foreach (var node in xml.Descendants().Where(x => x.Name.LocalName is "item" or "entry").Take(100))
         {
@@ -247,42 +295,4 @@ public sealed class CollectorService(
         return result;
     }
 
-    private static async Task ValidatePublicUrl(string value, CancellationToken ct)
-    {
-        if (!Uri.TryCreate(value, UriKind.Absolute, out var uri) || uri.Scheme != "https" ||
-            uri.UserInfo.Length > 0) throw new InvalidDataException("Only public HTTPS feeds are supported");
-        var addresses = await Dns.GetHostAddressesAsync(uri.DnsSafeHost, ct);
-        if (addresses.Length == 0 || addresses.Any(ip =>
-            IPAddress.IsLoopback(ip) || ip.IsIPv6LinkLocal || ip.IsIPv6SiteLocal ||
-            ip.IsIPv6Multicast || ip.Equals(IPAddress.Any) || ip.Equals(IPAddress.IPv6Any) ||
-            (ip.AddressFamily == AddressFamily.InterNetwork &&
-              (ip.GetAddressBytes()[0] is 0 or 10 or 127 ||
-               (ip.GetAddressBytes()[0] == 169 && ip.GetAddressBytes()[1] == 254) ||
-               (ip.GetAddressBytes()[0] == 172 && ip.GetAddressBytes()[1] is >= 16 and <= 31) ||
-               (ip.GetAddressBytes()[0] == 192 && ip.GetAddressBytes()[1] == 168)))))
-            throw new InvalidDataException("Private or non-public host is not allowed");
-    }
-
-    private sealed class LimitedStream(Stream inner, long maxBytes) : Stream
-    {
-        private long read;
-        public override bool CanRead => true;
-        public override bool CanSeek => false;
-        public override bool CanWrite => false;
-        public override long Length => throw new NotSupportedException();
-        public override long Position { get => read; set => throw new NotSupportedException(); }
-        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
-        {
-            var n = await inner.ReadAsync(buffer[..(int)Math.Min(buffer.Length, maxBytes + 1 - read)], ct);
-            read += n;
-            if (read > maxBytes) throw new InvalidDataException("Feed exceeds size limit");
-            return n;
-        }
-        public override int Read(byte[] buffer, int offset, int count) =>
-            ReadAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
-        public override void Flush() => throw new NotSupportedException();
-        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
-        public override void SetLength(long value) => throw new NotSupportedException();
-        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
-    }
 }
