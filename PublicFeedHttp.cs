@@ -7,6 +7,9 @@ public static class PublicFeedNetwork
 {
     public static void ValidateUri(Uri uri)
     {
+        var host=uri.IdnHost.TrimEnd('.').ToLowerInvariant();
+        if(new[]{"youtube.com","youtu.be","t.me","instagram.com","facebook.com","tiktok.com","x.com","twitter.com"}.Any(domain=>host==domain||host.EndsWith("."+domain,StringComparison.Ordinal)))
+            throw new System.Security.SecurityException("Social platform URLs require the social collector");
         if(uri.Scheme!="https" || uri.UserInfo.Length!=0 || uri.Host.Length==0 || uri.Host.Contains('%')
             || uri.IsLoopback || (!uri.Host.Contains('.') && uri.HostNameType==UriHostNameType.Dns)
             || new[]{".local",".localhost",".internal"}.Any(s=>uri.Host.EndsWith(s,StringComparison.OrdinalIgnoreCase)))
