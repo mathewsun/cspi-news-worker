@@ -24,7 +24,7 @@ public sealed class CollectorService(
     public const string Eligibility = """
         EXISTS (SELECT 1 FROM "Sources" s WHERE s."Id"=j.source_id AND s."Status" NOT IN (4,5)
             AND coalesce(to_jsonb(s)->>'CollectionKind','Rss')='Rss'
-            AND lower(coalesce(substring(lower(s."Url") from '^https?://(?:www[.]|m[.])?([^/:?#]+)'),'')) NOT IN ('youtube.com','youtu.be','t.me','instagram.com','facebook.com','tiktok.com','x.com','twitter.com')
+            AND rtrim(coalesce(substring(lower(s."Url") from '^https?://([^/:?#]+)'),''),'.') !~ '(^|[.])(youtube[.]com|youtu[.]be|t[.]me|instagram[.]com|facebook[.]com|tiktok[.]com|x[.]com|twitter[.]com)$'
             AND ((s."CollectionEnabled" IS TRUE AND s."VerificationState"='Verified'
                     AND NOT EXISTS (SELECT 1 FROM "NewsSourceCoverages" c WHERE c."SourceId"=s."Id"
                         AND c."VerificationState" IN ('VerificationFailed','Unavailable','Suspended')))
@@ -81,7 +81,7 @@ public sealed class CollectorService(
             SELECT s."Id" FROM "Sources" s
             WHERE s."CollectionEnabled" IS TRUE AND s."VerificationState"='Verified' AND s."Status" NOT IN (4,5)
               AND coalesce(to_jsonb(s)->>'CollectionKind','Rss')='Rss'
-              AND lower(coalesce(substring(lower(s."Url") from '^https?://(?:www[.]|m[.])?([^/:?#]+)'),'')) NOT IN ('youtube.com','youtu.be','t.me','instagram.com','facebook.com','tiktok.com','x.com','twitter.com')
+              AND rtrim(coalesce(substring(lower(s."Url") from '^https?://([^/:?#]+)'),''),'.') !~ '(^|[.])(youtube[.]com|youtu[.]be|t[.]me|instagram[.]com|facebook[.]com|tiktok[.]com|x[.]com|twitter[.]com)$'
               AND NOT EXISTS (SELECT 1 FROM "NewsSourceCoverages" c WHERE c."SourceId"=s."Id"
                 AND c."VerificationState" IN ('VerificationFailed','Unavailable','Suspended'))
             ON CONFLICT (source_id) DO NOTHING
